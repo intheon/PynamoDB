@@ -3,7 +3,7 @@ PynamoDB attributes
 """
 import calendar
 import collections.abc
-import json
+import simplejson as json
 import time
 import warnings
 from base64 import b64encode, b64decode
