@@ -2,13 +2,13 @@
 PynamoDB Indexes
 """
 from inspect import getmembers
-from typing import Any, Dict, Generic, List, Optional, TypeVar
+from typing import Any, Dict, Generic, List, Optional, Type, TypeVar
 from typing import TYPE_CHECKING
 
-from pynamodb._compat import GenericMeta
 from pynamodb.constants import (
     INCLUDE, ALL, KEYS_ONLY, ATTR_NAME, ATTR_TYPE, KEY_TYPE, KEY_SCHEMA,
-    ATTR_DEFINITIONS, META_CLASS_NAME
+    ATTR_DEFINITIONS, PROJECTION_TYPE, NON_KEY_ATTRIBUTES,
+    READ_CAPACITY_UNITS, WRITE_CAPACITY_UNITS,
 )
 from pynamodb.attributes import Attribute
 from pynamodb.expressions.condition import Condition
@@ -22,37 +22,31 @@ _KeyType = Any
 _M = TypeVar('_M', bound='Model')
 
 
-class IndexMeta(GenericMeta):
-    """
-    Index meta class
-
-    This class is here to allow for an index `Meta` class
-    that contains the index settings
-    """
-    def __init__(self, name, bases, attrs, *args, **kwargs):
-        super().__init__(name, bases, attrs, *args, **kwargs)  # type: ignore
-        if isinstance(attrs, dict):
-            for attr_name, attr_obj in attrs.items():
-                if attr_name == META_CLASS_NAME:
-                    meta_cls = attrs.get(META_CLASS_NAME)
-                    if meta_cls is not None:
-                        meta_cls.attributes = None
-                elif isinstance(attr_obj, Attribute):
-                    if attr_obj.attr_name is None:
-                        attr_obj.attr_name = attr_name
-
-
-class Index(Generic[_M], metaclass=IndexMeta):
+class Index(Generic[_M]):
     """
     Base class for secondary indexes
     """
     Meta: Any = None
+
+    @classmethod
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if cls.Meta is not None:
+            cls.Meta.attributes = {}
+            for name, attribute in getmembers(cls, lambda o: isinstance(o, Attribute)):
+                cls.Meta.attributes[name] = attribute
 
     def __init__(self) -> None:
         if self.Meta is None:
             raise ValueError("Indexes require a Meta class for settings")
         if not hasattr(self.Meta, "projection"):
             raise ValueError("No projection defined, define a projection for this class")
+
+    def __set_name__(self, owner: Type[_M], name: str):
+        if not hasattr(self.Meta, "model"):
+            self.Meta.model = owner
+        if not hasattr(self.Meta, "index_name"):
+            self.Meta.index_name = name
 
     @classmethod
     def count(
@@ -120,7 +114,7 @@ class Index(Generic[_M], metaclass=IndexMeta):
         consistent_read: Optional[bool] = None,
         rate_limit: Optional[float] = None,
         attributes_to_get: Optional[List[str]] = None,
-    ):
+    ) -> ResultIterator[_M]:
         """
         Scans an index
         """
@@ -142,7 +136,7 @@ class Index(Generic[_M], metaclass=IndexMeta):
         """
         Returns the attribute class for the hash key
         """
-        for attr_cls in cls._get_attributes().values():
+        for attr_cls in cls.Meta.attributes.values():
             if attr_cls.is_hash_key:
                 return attr_cls
 
@@ -151,45 +145,44 @@ class Index(Generic[_M], metaclass=IndexMeta):
         """
         Returns the schema for this index
         """
-        attr_definitions = []
-        schema = []
-        for attr_name, attr_cls in cls._get_attributes().items():
-            attr_definitions.append({
-                'attribute_name': attr_cls.attr_name,
-                'attribute_type': attr_cls.attr_type
-            })
+        schema = {
+            'index_name': cls.Meta.index_name,
+            'key_schema': [],
+            'projection': {
+                PROJECTION_TYPE: cls.Meta.projection.projection_type,
+            },
+        }
+        for attr_cls in cls.Meta.attributes.values():
             if attr_cls.is_hash_key:
-                schema.append({
+                schema['key_schema'].append({
                     ATTR_NAME: attr_cls.attr_name,
                     KEY_TYPE: HASH
                 })
             elif attr_cls.is_range_key:
-                schema.append({
+                schema['key_schema'].append({
                     ATTR_NAME: attr_cls.attr_name,
                     KEY_TYPE: RANGE
                 })
-        return {
-            'key_schema': schema,
-            'attribute_definitions': attr_definitions
-        }
-
-    @classmethod
-    def _get_attributes(cls):
-        """
-        Returns the list of attributes for this class
-        """
-        if cls.Meta.attributes is None:
-            cls.Meta.attributes = {}
-            for name, attribute in getmembers(cls, lambda o: isinstance(o, Attribute)):
-                cls.Meta.attributes[name] = attribute
-        return cls.Meta.attributes
+        if cls.Meta.projection.non_key_attributes:
+            schema['projection'][NON_KEY_ATTRIBUTES] = cls.Meta.projection.non_key_attributes
+        return schema
 
 
 class GlobalSecondaryIndex(Index[_M]):
     """
     A global secondary index
     """
-    pass
+
+    @classmethod
+    def _get_schema(cls) -> Dict:
+        schema = super()._get_schema()
+        provisioned_throughput = {}
+        if hasattr(cls.Meta, 'read_capacity_units'):
+            provisioned_throughput[READ_CAPACITY_UNITS] = cls.Meta.read_capacity_units
+        if hasattr(cls.Meta, 'write_capacity_units'):
+            provisioned_throughput[WRITE_CAPACITY_UNITS] = cls.Meta.write_capacity_units
+        schema['provisioned_throughput'] = provisioned_throughput
+        return schema
 
 
 class LocalSecondaryIndex(Index[_M]):

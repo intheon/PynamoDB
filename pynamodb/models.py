@@ -1,6 +1,7 @@
 """
 DynamoDB Models for PynamoDB
 """
+import json
 import random
 import time
 import logging
@@ -23,22 +24,26 @@ from typing import TypeVar
 from typing import Union
 from typing import cast
 
+from pynamodb.connection.base import MetaTable
+
 if sys.version_info >= (3, 8):
     from typing import Protocol
 else:
     from typing_extensions import Protocol
 
 from pynamodb.expressions.update import Action
-from pynamodb.exceptions import DoesNotExist, TableDoesNotExist, TableError, InvalidStateError, PutError
+from pynamodb.exceptions import DoesNotExist, TableDoesNotExist, TableError, InvalidStateError, PutError, \
+    AttributeNullError
 from pynamodb.attributes import (
     AttributeContainer, AttributeContainerMeta, TTLAttribute, VersionAttribute
 )
 from pynamodb.connection.table import TableConnection
 from pynamodb.expressions.condition import Condition
 from pynamodb.types import HASH, RANGE
-from pynamodb.indexes import Index, GlobalSecondaryIndex
+from pynamodb.indexes import Index, GlobalSecondaryIndex, LocalSecondaryIndex
 from pynamodb.pagination import ResultIterator
 from pynamodb.settings import get_settings_value, OperationSettings
+from pynamodb import constants
 from pynamodb.constants import (
     ATTR_DEFINITIONS, ATTR_NAME, ATTR_TYPE, KEY_SCHEMA,
     KEY_TYPE, ITEM, READ_CAPACITY_UNITS, WRITE_CAPACITY_UNITS,
@@ -51,8 +56,10 @@ from pynamodb.constants import (
     BATCH_WRITE_PAGE_LIMIT,
     META_CLASS_NAME, REGION, HOST, NULL,
     COUNT, ITEM_COUNT, KEY, UNPROCESSED_ITEMS, STREAM_VIEW_TYPE,
-    STREAM_SPECIFICATION, STREAM_ENABLED, BILLING_MODE, PAY_PER_REQUEST_BILLING_MODE, TAGS
+    STREAM_SPECIFICATION, STREAM_ENABLED, BILLING_MODE, PAY_PER_REQUEST_BILLING_MODE, TAGS, TABLE_NAME
 )
+from pynamodb.util import attribute_value_to_json
+from pynamodb.util import json_to_attribute_value
 
 _T = TypeVar('_T', bound='Model')
 _KeyType = Any
@@ -202,6 +209,7 @@ class MetaModel(AttributeContainerMeta):
 
     def __init__(self, name, bases, namespace, discriminator=None) -> None:
         super().__init__(name, bases, namespace, discriminator)
+        MetaModel._initialize_indexes(self)
         cls = cast(Type['Model'], self)
         for attr_name, attribute in cls.get_attributes().items():
             if attribute.is_hash_key:
@@ -252,10 +260,6 @@ class MetaModel(AttributeContainerMeta):
                         setattr(attr_obj, 'aws_secret_access_key', None)
                     if not hasattr(attr_obj, 'aws_session_token'):
                         setattr(attr_obj, 'aws_session_token', None)
-                elif isinstance(attr_obj, Index):
-                    attr_obj.Meta.model = cls
-                    if not hasattr(attr_obj.Meta, "index_name"):
-                        attr_obj.Meta.index_name = attr_name
 
             # create a custom Model.DoesNotExist derived from pynamodb.exceptions.DoesNotExist,
             # so that "except Model.DoesNotExist:" would not catch other models' exceptions
@@ -265,6 +269,15 @@ class MetaModel(AttributeContainerMeta):
                     '__qualname__': f'{cls.__qualname__}.{"DoesNotExist"}',
                 }
                 cls.DoesNotExist = type('DoesNotExist', (DoesNotExist, ), exception_attrs)
+
+    @staticmethod
+    def _initialize_indexes(cls):
+        """
+        Initialize indexes on the class.
+        """
+        cls._indexes = {}
+        for name, index in getmembers(cls, lambda o: isinstance(o, Index)):
+            cls._indexes[index.Meta.index_name] = index
 
 
 class Model(AttributeContainer, metaclass=MetaModel):
@@ -279,13 +292,12 @@ class Model(AttributeContainer, metaclass=MetaModel):
     # DynamoDB attributes
     _hash_keyname: Optional[str] = None
     _range_keyname: Optional[str] = None
-    _indexes: Optional[Dict[str, List[Any]]] = None
     _connection: Optional[TableConnection] = None
-    _index_classes: Optional[Dict[str, Any]] = None
     DoesNotExist: Type[DoesNotExist] = DoesNotExist
     _version_attribute_name: Optional[str] = None
 
     Meta: MetaProtocol
+    _indexes: Dict[str, Index]
 
     def __init__(
         self,
@@ -323,7 +335,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
         :param items: Should be a list of hash keys to retrieve, or a list of
             tuples if range keys are used.
         """
-        items = list(items)
+        items = set(items)
         hash_key_attribute = cls._hash_key_attribute()
         range_key_attribute = cls._range_key_attribute()
         keys_to_get: List[Any] = []
@@ -593,9 +605,8 @@ class Model(AttributeContainer, metaclass=MetaModel):
                 raise ValueError('A hash_key must be given to use filters')
             return cls.describe_table().get(ITEM_COUNT)
 
-        cls._get_indexes()
-        if cls._index_classes and index_name:
-            hash_key = cls._index_classes[index_name]._hash_key_attribute().serialize(hash_key)
+        if index_name:
+            hash_key = cls._indexes[index_name]._hash_key_attribute().serialize(hash_key)
         else:
             hash_key = cls._serialize_keys(hash_key)[0]
 
@@ -660,9 +671,8 @@ class Model(AttributeContainer, metaclass=MetaModel):
         :param page_size: Page size of the query to DynamoDB
         :param rate_limit: If set then consumed capacity will be limited to this amount per second
         """
-        cls._get_indexes()
-        if index_name and cls._index_classes:
-            hash_key = cls._index_classes[index_name]._hash_key_attribute().serialize(hash_key)
+        if index_name:
+            hash_key = cls._indexes[index_name]._hash_key_attribute().serialize(hash_key)
         else:
             hash_key = cls._serialize_keys(hash_key)[0]
 
@@ -795,7 +805,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
         :param wait: If set, then this call will block until the table is ready for use
         :param read_capacity_units: Sets the read capacity units for this table
         :param write_capacity_units: Sets the write capacity units for this table
-        :param billing_mode: Sets the billing mode provisioned (default) or on_demand for this table
+        :param billing_mode: Sets the billing mode 'PROVISIONED' (default) or 'PAY_PER_REQUEST' for this table
         """
         if not cls.exists():
             schema = cls._get_schema()
@@ -818,16 +828,6 @@ class Model(AttributeContainer, metaclass=MetaModel):
                 schema['write_capacity_units'] = write_capacity_units
             if billing_mode is not None:
                 schema['billing_mode'] = billing_mode
-            index_data = cls._get_indexes()
-            schema['global_secondary_indexes'] = index_data.get('global_secondary_indexes')
-            schema['local_secondary_indexes'] = index_data.get('local_secondary_indexes')
-            index_attrs = index_data.get('attribute_definitions')
-            attr_keys = [attr.get('attribute_name') for attr in schema['attribute_definitions']]
-            for attr in index_attrs:
-                attr_name = attr.get('attribute_name')
-                if attr_name not in attr_keys:
-                    schema['attribute_definitions'].append(attr)
-                    attr_keys.append(attr_name)
             cls._get_connection().create_table(
                 **schema
             )
@@ -864,7 +864,6 @@ class Model(AttributeContainer, metaclass=MetaModel):
                     raise
 
     # Private API below
-
     @classmethod
     def _get_schema(cls) -> Dict[str, Any]:
         """
@@ -872,63 +871,46 @@ class Model(AttributeContainer, metaclass=MetaModel):
         """
         schema: Dict[str, List] = {
             'attribute_definitions': [],
-            'key_schema': []
+            'key_schema': [],
+            'global_secondary_indexes': [],
+            'local_secondary_indexes': [],
         }
         for attr_name, attr_cls in cls.get_attributes().items():
             if attr_cls.is_hash_key or attr_cls.is_range_key:
                 schema['attribute_definitions'].append({
-                    'attribute_name': attr_cls.attr_name,
-                    'attribute_type': attr_cls.attr_type
+                    ATTR_NAME: attr_cls.attr_name,
+                    ATTR_TYPE: attr_cls.attr_type
                 })
             if attr_cls.is_hash_key:
                 schema['key_schema'].append({
-                    'key_type': HASH,
-                    'attribute_name': attr_cls.attr_name
+                    KEY_TYPE: HASH,
+                    ATTR_NAME: attr_cls.attr_name
                 })
             elif attr_cls.is_range_key:
                 schema['key_schema'].append({
-                    'key_type': RANGE,
-                    'attribute_name': attr_cls.attr_name
+                    KEY_TYPE: RANGE,
+                    ATTR_NAME: attr_cls.attr_name
+                })
+        for index in cls._indexes.values():
+            index_schema = index._get_schema()
+            if isinstance(index, GlobalSecondaryIndex):
+                if getattr(cls.Meta, 'billing_mode', None) == PAY_PER_REQUEST_BILLING_MODE:
+                    index_schema.pop('provisioned_throughput', None)
+                schema['global_secondary_indexes'].append(index_schema)
+            else:
+                schema['local_secondary_indexes'].append(index_schema)
+        attr_names = {key_schema[ATTR_NAME]
+                      for index_schema in (*schema['global_secondary_indexes'], *schema['local_secondary_indexes'])
+                      for key_schema in index_schema['key_schema']}
+        attr_keys = {attr[ATTR_NAME] for attr in schema['attribute_definitions']}
+        for attr_name in attr_names:
+            if attr_name not in attr_keys:
+                attr_cls = cls.get_attributes()[cls._dynamo_to_python_attr(attr_name)]
+                schema['attribute_definitions'].append({
+                    ATTR_NAME: attr_cls.attr_name,
+                    ATTR_TYPE: attr_cls.attr_type
                 })
         return schema
-
-    @classmethod
-    def _get_indexes(cls):
-        """
-        Returns a list of the secondary indexes
-        """
-        if cls._indexes is None:
-            cls._indexes = {
-                'global_secondary_indexes': [],
-                'local_secondary_indexes': [],
-                'attribute_definitions': []
-            }
-            cls._index_classes = {}
-            for name, index in getmembers(cls, lambda o: isinstance(o, Index)):
-                cls._index_classes[index.Meta.index_name] = index
-                schema = index._get_schema()
-                idx = {
-                    'index_name': index.Meta.index_name,
-                    'key_schema': schema.get('key_schema'),
-                    'projection': {
-                        PROJECTION_TYPE: index.Meta.projection.projection_type,
-                    },
-
-                }
-                if isinstance(index, GlobalSecondaryIndex):
-                    if getattr(cls.Meta, 'billing_mode', None) != PAY_PER_REQUEST_BILLING_MODE:
-                        idx['provisioned_throughput'] = {
-                            READ_CAPACITY_UNITS: index.Meta.read_capacity_units,
-                            WRITE_CAPACITY_UNITS: index.Meta.write_capacity_units
-                        }
-                cls._indexes['attribute_definitions'].extend(schema.get('attribute_definitions'))
-                if index.Meta.projection.non_key_attributes:
-                    idx['projection'][NON_KEY_ATTRIBUTES] = index.Meta.projection.non_key_attributes
-                if isinstance(index, GlobalSecondaryIndex):
-                    cls._indexes['global_secondary_indexes'].append(idx)
-                else:
-                    cls._indexes['local_secondary_indexes'].append(idx)
-        return cls._indexes
 
     def _get_save_args(self, null_check: bool = True, condition: Optional[Condition] = None) -> Tuple[Iterable[Any], Dict[str, Any]]:
         """
@@ -1090,7 +1072,28 @@ class Model(AttributeContainer, metaclass=MetaModel):
         # For now we just check that the connection exists and (in the case of model inheritance)
         # points to the same table. In the future we should update the connection if any of the attributes differ.
         if cls._connection is None or cls._connection.table_name != cls.Meta.table_name:
+            schema = cls._get_schema()
+            meta_table = MetaTable({
+                constants.TABLE_NAME: cls.Meta.table_name,
+                constants.KEY_SCHEMA: schema['key_schema'],
+                constants.ATTR_DEFINITIONS: schema['attribute_definitions'],
+                constants.GLOBAL_SECONDARY_INDEXES: [
+                    {
+                        constants.INDEX_NAME: index_schema['index_name'],
+                        constants.KEY_SCHEMA: index_schema['key_schema'],
+                    }
+                    for index_schema in schema['global_secondary_indexes']
+                ],
+                constants.LOCAL_SECONDARY_INDEXES: [
+                    {
+                        constants.INDEX_NAME: index_schema['index_name'],
+                        constants.KEY_SCHEMA: index_schema['key_schema'],
+                    }
+                    for index_schema in schema['local_secondary_indexes']
+                ],
+            })
             cls._connection = TableConnection(cls.Meta.table_name,
+                                              meta_table=meta_table,
                                               region=cls.Meta.region,
                                               host=cls.Meta.host,
                                               connect_timeout_seconds=cls.Meta.connect_timeout_seconds,
@@ -1116,7 +1119,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
 
         if serialized is None:
             if not attr.null:
-                raise ValueError("Attribute '{}' cannot be None".format(attr.attr_name))
+                raise AttributeNullError(attr.attr_name)
             return {NULL: True}
 
         return {attr.attr_type: serialized}
@@ -1146,6 +1149,14 @@ class Model(AttributeContainer, metaclass=MetaModel):
         Sets attributes sent back from DynamoDB on this object
         """
         return self._container_deserialize(attribute_values=attribute_values)
+
+    def to_json(self) -> str:
+        return json.dumps({k: attribute_value_to_json(v) for k, v in self.serialize().items()})
+
+    def from_json(self, s: str) -> None:
+        attribute_values = {k: json_to_attribute_value(v) for k, v in json.loads(s).items()}
+        self._update_attribute_types(attribute_values)
+        self.deserialize(attribute_values)
 
 
 class _ModelFuture(Generic[_T]):

@@ -30,7 +30,6 @@ from pynamodb.attributes import (
     BooleanAttribute, ListAttribute, TTLAttribute, VersionAttribute)
 from .data import (
     MODEL_TABLE_DATA, GET_MODEL_ITEM_DATA, SIMPLE_MODEL_TABLE_DATA,
-    DESCRIBE_TABLE_DATA_PAY_PER_REQUEST,
     BATCH_GET_ITEMS, SIMPLE_BATCH_GET_ITEMS, COMPLEX_TABLE_DATA,
     COMPLEX_ITEM_DATA, INDEX_TABLE_DATA, LOCAL_INDEX_TABLE_DATA, DOG_TABLE_DATA,
     CUSTOM_ATTR_NAME_INDEX_TABLE_DATA, CUSTOM_ATTR_NAME_ITEM_DATA,
@@ -392,20 +391,20 @@ class BooleanModel(Model):
     is_human = BooleanAttribute()
 
 
-class TreeLeaf2(MapAttribute):
-    value = NumberAttribute()
-
-
-class TreeLeaf1(MapAttribute):
-    value = NumberAttribute()
-    left = TreeLeaf2()
-    right = TreeLeaf2()
-
-
 class TreeLeaf(MapAttribute):
     value = NumberAttribute()
-    left = TreeLeaf1()
-    right = TreeLeaf1()
+
+
+class TreeNode2(MapAttribute):
+    value = NumberAttribute()
+    left = TreeLeaf()
+    right = TreeLeaf()
+
+
+class TreeNode1(MapAttribute):
+    value = NumberAttribute()
+    left = TreeNode2()
+    right = TreeNode2()
 
 
 class TreeModel(Model):
@@ -413,8 +412,8 @@ class TreeModel(Model):
         table_name = 'TreeModelTable'
 
     tree_key = UnicodeAttribute(hash_key=True)
-    left = TreeLeaf()
-    right = TreeLeaf()
+    left = TreeNode1()
+    right = TreeNode1()
 
 
 class ExplicitRawMapModel(Model):
@@ -556,24 +555,11 @@ class ModelTestCase(TestCase):
         self.assertEqual(UserModel.Meta.read_capacity_units, 25)
         self.assertEqual(UserModel.Meta.write_capacity_units, 25)
 
-        # Test for wrong billing_mode
-        setattr(UserModel.Meta, 'billing_mode', 'WRONG')
-        with patch(PATCH_METHOD) as req:
-            req.return_value = MODEL_TABLE_DATA
-            self.assertRaises(ValueError)
-        delattr(UserModel.Meta, 'billing_mode')
-
         # A table with billing_mode set as on_demand
         self.assertEqual(BillingModeOnDemandModel.Meta.billing_mode, 'PAY_PER_REQUEST')
         with patch(PATCH_METHOD) as req:
-            req.return_value = DESCRIBE_TABLE_DATA_PAY_PER_REQUEST
+            req.return_value = MODEL_TABLE_DATA
             BillingModeOnDemandModel.create_table(read_capacity_units=2, write_capacity_units=2)
-            self.assertEqual(BillingModeOnDemandModel._connection.get_meta_table().data
-                             .get('BillingModeSummary', {}).get('BillingMode', None), 'PAY_PER_REQUEST')
-            self.assertEqual(BillingModeOnDemandModel._connection.get_meta_table().data
-                             .get('ProvisionedThroughput', {}).get('ReadCapacityUnits', None), 0)
-            self.assertEqual(BillingModeOnDemandModel._connection.get_meta_table().data
-                             .get('ProvisionedThroughput', {}).get('WriteCapacityUnits', None), 0)
 
         UserModel._connection = None
 
@@ -683,12 +669,12 @@ class ModelTestCase(TestCase):
         schema = CustomAttrNameModel._get_schema()
         correct_schema = {
             'KeySchema': [
-                {'key_type': 'HASH', 'attribute_name': 'user_name'},
-                {'key_type': 'RANGE', 'attribute_name': 'user_id'}
+                {'KeyType': 'HASH', 'AttributeName': 'user_name'},
+                {'KeyType': 'RANGE', 'AttributeName': 'user_id'}
             ],
             'AttributeDefinitions': [
-                {'attribute_type': 'S', 'attribute_name': 'user_name'},
-                {'attribute_type': 'S', 'attribute_name': 'user_id'}
+                {'AttributeType': 'S', 'AttributeName': 'user_name'},
+                {'AttributeType': 'S', 'AttributeName': 'user_id'}
             ]
         }
         self.assert_dict_lists_equal(correct_schema['KeySchema'], schema['key_schema'])
@@ -1414,6 +1400,33 @@ class ModelTestCase(TestCase):
             self.assertEqual(results_iter.total_count, 10)
             self.assertEqual(results_iter.page_iter.total_scanned_count, 10)
 
+    def test_query_with_failure(self):
+        items = [
+            {
+                **GET_MODEL_ITEM_DATA[ITEM],
+                'user_id': {
+                    STRING: f'id-{idx}'
+                },
+            }
+            for idx in range(30)
+        ]
+
+        with patch(PATCH_METHOD) as req:
+            req.side_effect = [
+                Exception('bleep-bloop'),
+                {'Count': 10, 'ScannedCount': 10, 'Items': items[0:10], 'LastEvaluatedKey': {'user_id': items[10]['user_id']}},
+            ]
+            results_iter = UserModel.query('foo', limit=10, page_size=10)
+
+            with pytest.raises(Exception, match='bleep-bloop'):
+                next(results_iter)
+
+            first_item = next(results_iter)
+            assert first_item.user_id == 'id-0'
+
+            second_item = next(results_iter)
+            assert second_item.user_id == 'id-1'
+
     def test_query(self):
         """
         Model.query
@@ -1877,27 +1890,29 @@ class ModelTestCase(TestCase):
         Model.batch_get
         """
         self.init_table_meta(SimpleUserModel, SIMPLE_MODEL_TABLE_DATA)
+        self.maxDiff = None
 
         with patch(PATCH_METHOD) as req:
             req.return_value = SIMPLE_BATCH_GET_ITEMS
             item_keys = ['hash-{}'.format(x) for x in range(10)]
             for item in SimpleUserModel.batch_get(item_keys):
                 self.assertIsNotNone(item)
+            req.call_args[0][1]['RequestItems']['SimpleModel']['Keys'].sort(key=json.dumps)
             params = {
                 'ReturnConsumedCapacity': 'TOTAL',
                 'RequestItems': {
                     'SimpleModel': {
                         'Keys': [
-                            {'user_name': {'S': 'hash-9'}},
-                            {'user_name': {'S': 'hash-8'}},
-                            {'user_name': {'S': 'hash-7'}},
-                            {'user_name': {'S': 'hash-6'}},
-                            {'user_name': {'S': 'hash-5'}},
-                            {'user_name': {'S': 'hash-4'}},
-                            {'user_name': {'S': 'hash-3'}},
-                            {'user_name': {'S': 'hash-2'}},
+                            {'user_name': {'S': 'hash-0'}},
                             {'user_name': {'S': 'hash-1'}},
-                            {'user_name': {'S': 'hash-0'}}
+                            {'user_name': {'S': 'hash-2'}},
+                            {'user_name': {'S': 'hash-3'}},
+                            {'user_name': {'S': 'hash-4'}},
+                            {'user_name': {'S': 'hash-5'}},
+                            {'user_name': {'S': 'hash-6'}},
+                            {'user_name': {'S': 'hash-7'}},
+                            {'user_name': {'S': 'hash-8'}},
+                            {'user_name': {'S': 'hash-9'}},
                         ]
                     }
                 }
@@ -1909,21 +1924,22 @@ class ModelTestCase(TestCase):
             item_keys = ['hash-{}'.format(x) for x in range(10)]
             for item in SimpleUserModel.batch_get(item_keys, attributes_to_get=['numbers']):
                 self.assertIsNotNone(item)
+            req.call_args[0][1]['RequestItems']['SimpleModel']['Keys'].sort(key=json.dumps)
             params = {
                 'ReturnConsumedCapacity': 'TOTAL',
                 'RequestItems': {
                     'SimpleModel': {
                         'Keys': [
-                            {'user_name': {'S': 'hash-9'}},
-                            {'user_name': {'S': 'hash-8'}},
-                            {'user_name': {'S': 'hash-7'}},
-                            {'user_name': {'S': 'hash-6'}},
-                            {'user_name': {'S': 'hash-5'}},
-                            {'user_name': {'S': 'hash-4'}},
-                            {'user_name': {'S': 'hash-3'}},
-                            {'user_name': {'S': 'hash-2'}},
+                            {'user_name': {'S': 'hash-0'}},
                             {'user_name': {'S': 'hash-1'}},
-                            {'user_name': {'S': 'hash-0'}}
+                            {'user_name': {'S': 'hash-2'}},
+                            {'user_name': {'S': 'hash-3'}},
+                            {'user_name': {'S': 'hash-4'}},
+                            {'user_name': {'S': 'hash-5'}},
+                            {'user_name': {'S': 'hash-6'}},
+                            {'user_name': {'S': 'hash-7'}},
+                            {'user_name': {'S': 'hash-8'}},
+                            {'user_name': {'S': 'hash-9'}}
                         ],
                         'ProjectionExpression': '#0',
                         'ExpressionAttributeNames': {
@@ -1939,21 +1955,22 @@ class ModelTestCase(TestCase):
             item_keys = ['hash-{}'.format(x) for x in range(10)]
             for item in SimpleUserModel.batch_get(item_keys, consistent_read=True):
                 self.assertIsNotNone(item)
+            req.call_args[0][1]['RequestItems']['SimpleModel']['Keys'].sort(key=json.dumps)
             params = {
                 'ReturnConsumedCapacity': 'TOTAL',
                 'RequestItems': {
                     'SimpleModel': {
                         'Keys': [
-                            {'user_name': {'S': 'hash-9'}},
-                            {'user_name': {'S': 'hash-8'}},
-                            {'user_name': {'S': 'hash-7'}},
-                            {'user_name': {'S': 'hash-6'}},
-                            {'user_name': {'S': 'hash-5'}},
-                            {'user_name': {'S': 'hash-4'}},
-                            {'user_name': {'S': 'hash-3'}},
-                            {'user_name': {'S': 'hash-2'}},
+                            {'user_name': {'S': 'hash-0'}},
                             {'user_name': {'S': 'hash-1'}},
-                            {'user_name': {'S': 'hash-0'}}
+                            {'user_name': {'S': 'hash-2'}},
+                            {'user_name': {'S': 'hash-3'}},
+                            {'user_name': {'S': 'hash-4'}},
+                            {'user_name': {'S': 'hash-5'}},
+                            {'user_name': {'S': 'hash-6'}},
+                            {'user_name': {'S': 'hash-7'}},
+                            {'user_name': {'S': 'hash-8'}},
+                            {'user_name': {'S': 'hash-9'}}
                         ],
                         'ConsistentRead': True
                     }
@@ -2095,21 +2112,16 @@ class ModelTestCase(TestCase):
                 {
                     UNPROCESSED_ITEMS: {
                         UserModel.Meta.table_name: unprocessed_items[:2],
-                    }
+                    },
                 },
-                {
-                    UNPROCESSED_ITEMS: {
-                        UserModel.Meta.table_name: unprocessed_items[2:],
-                    }
-                },
-                {}
+                {},
             ]
 
             with UserModel.batch_write() as batch:
                 for item in items:
                     batch.save(item)
 
-            self.assertEqual(len(req.mock_calls), 3)
+            self.assertEqual(len(req.mock_calls), 2)
 
     def test_batch_write_raises_put_error(self):
         items = []
@@ -2129,19 +2141,11 @@ class ModelTestCase(TestCase):
             })
 
         with patch(PATCH_METHOD) as req:
-            req.side_effect = [
-                {
-                    UNPROCESSED_ITEMS: {
-                        BatchModel.Meta.table_name: unprocessed_items[:2],
-                    }
-                },
-                {
-                    UNPROCESSED_ITEMS: {
-                        BatchModel.Meta.table_name: unprocessed_items[2:],
-                    }
-                },
-                {}
-            ]
+            req.return_value = {
+                UNPROCESSED_ITEMS: {
+                    BatchModel.Meta.table_name: unprocessed_items[2:],
+                }
+            }
             with self.assertRaises(PutError):
                 with BatchModel.batch_write() as batch:
                     for item in items:
@@ -2377,18 +2381,22 @@ class ModelTestCase(TestCase):
 
         with patch(PATCH_METHOD, new=fake_db) as req:
             IndexedModel.create_table(read_capacity_units=2, write_capacity_units=2)
-            params = {
-                'AttributeDefinitions': [
-                    {'attribute_name': 'email', 'attribute_type': 'S'},
-                    {'attribute_name': 'numbers', 'attribute_type': 'NS'}
-                ],
-                'KeySchema': [
-                    {'AttributeName': 'numbers', 'KeyType': 'RANGE'},
-                    {'AttributeName': 'email', 'KeyType': 'HASH'}
-                ]
-            }
-            schema = IndexedModel.email_index._get_schema()
             args = req.call_args[0][1]
+            self.assert_dict_lists_equal(
+                args['AttributeDefinitions'],
+                [
+                    {'AttributeName': 'user_name', 'AttributeType': 'S'},
+                    {'AttributeName': 'email', 'AttributeType': 'S'},
+                    {'AttributeName': 'numbers', 'AttributeType': 'NS'}
+                ]
+            )
+            self.assert_dict_lists_equal(
+                args['GlobalSecondaryIndexes'][0]['KeySchema'],
+                [
+                    {'AttributeName': 'email', 'KeyType': 'HASH'},
+                    {'AttributeName': 'numbers', 'KeyType': 'RANGE'}
+                ]
+            )
             self.assertEqual(
                 args['GlobalSecondaryIndexes'][0]['ProvisionedThroughput'],
                 {
@@ -2396,8 +2404,6 @@ class ModelTestCase(TestCase):
                     'WriteCapacityUnits': 1
                 }
             )
-            self.assert_dict_lists_equal(schema['key_schema'], params['KeySchema'])
-            self.assert_dict_lists_equal(schema['attribute_definitions'], params['AttributeDefinitions'])
 
     def test_local_index(self):
         """
@@ -2413,7 +2419,7 @@ class ModelTestCase(TestCase):
             req.return_value = LOCAL_INDEX_TABLE_DATA
             LocalIndexedModel('foo')
 
-        schema = IndexedModel._get_indexes()
+        schema = IndexedModel._get_schema()
 
         expected = {
             'local_secondary_indexes': [
@@ -2444,10 +2450,9 @@ class ModelTestCase(TestCase):
                 }
             ],
             'attribute_definitions': [
-                {'attribute_type': 'S', 'attribute_name': 'email'},
-                {'attribute_type': 'NS', 'attribute_name': 'numbers'},
-                {'attribute_type': 'S', 'attribute_name': 'email'},
-                {'attribute_type': 'NS', 'attribute_name': 'numbers'}
+                {'AttributeType': 'S', 'AttributeName': 'user_name'},
+                {'AttributeType': 'S', 'AttributeName': 'email'},
+                {'AttributeType': 'NS', 'AttributeName': 'numbers'}
             ]
         }
         self.assert_dict_lists_equal(
@@ -2493,7 +2498,6 @@ class ModelTestCase(TestCase):
             }
             schema = LocalIndexedModel.email_index._get_schema()
             args = req.call_args[0][1]
-            self.assert_dict_lists_equal(schema['attribute_definitions'], params['AttributeDefinitions'])
             self.assert_dict_lists_equal(schema['key_schema'], params['KeySchema'])
             self.assertTrue('ProvisionedThroughput' not in args['LocalSecondaryIndexes'][0])
 
@@ -2545,6 +2549,40 @@ class ModelTestCase(TestCase):
             user_name = UnicodeAttribute(hash_key=True)
         with self.assertRaises(AttributeError):
             MissingTableNameModel.exists()
+
+    def test_to_json(self):
+        """
+        Model.to_json
+        """
+        user = UserModel()
+        user.custom_user_name = 'foo'
+        user.user_id = 'bar'
+        user.picture = base64.b64decode(BINARY_ATTR_DATA)
+        user.zip_code = 88030
+        json_user = json.loads(user.to_json())
+        self.assertEqual(json_user['user_name'], user.custom_user_name)  # uses custom attribute name
+        self.assertEqual(json_user['user_id'], user.user_id)
+        self.assertEqual(json_user['picture'], BINARY_ATTR_DATA)
+        self.assertEqual(json_user['zip_code'], user.zip_code)
+        self.assertEqual(json_user['email'], 'needs_email')  # set to default value
+
+    def test_from_json(self):
+        """
+        Model.from_json
+        """
+        json_user = {
+            'user_name': 'foo',
+            'user_id': 'bar',
+            'picture': BINARY_ATTR_DATA,
+            'zip_code': 88030,
+        }
+        user = UserModel()
+        user.from_json(json.dumps(json_user))
+        self.assertEqual(user.custom_user_name, json_user['user_name'])  # uses custom attribute name
+        self.assertEqual(user.user_id, json_user['user_id'])
+        self.assertEqual(user.picture, base64.b64decode(json_user['picture']))
+        self.assertEqual(user.zip_code, json_user['zip_code'])
+        self.assertEqual(user.email, 'needs_email')  # set to default value
 
     def _get_office_employee(self):
         justin = Person(
@@ -2665,8 +2703,9 @@ class ModelTestCase(TestCase):
         car_info = CarInfoMap(model='Envoy')
         item = CarModel(car_id=123, car_info=car_info)
         with patch(PATCH_METHOD):
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ValueError) as cm:
                 item.save()
+            assert str(cm.exception) == "Attribute 'car_info.make' cannot be None"
 
     def test_model_works_like_model(self):
         office_employee = self._get_office_employee()
@@ -2700,12 +2739,9 @@ class ModelTestCase(TestCase):
                                  '123')
 
         with patch(PATCH_METHOD, new=fake_db) as req:
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ValueError) as cm:
                 CarModel(car_id=2).save()
-            try:
-                CarModel(car_id=2).save()
-            except ValueError as e:
-                assert str(e) == "Attribute 'car_info' cannot be None"
+            assert str(cm.exception) == "Attribute 'car_info' cannot be None"
 
     def test_model_with_maps_retrieve_from_db(self):
         fake_db = self.database_mocker(OfficeEmployee, OFFICE_EMPLOYEE_MODEL_TABLE_DATA,
@@ -2897,40 +2933,60 @@ class ModelTestCase(TestCase):
             self.assertTrue(item.is_human)
 
     def test_serializing_map_with_null_check(self):
-        item = TreeModel(
+        class TreeModelWithList(TreeModel):
+            leaves = ListAttribute(of=TreeLeaf)
+
+        item = TreeModelWithList(
             tree_key='test',
-            left=TreeLeaf(
+            left=TreeNode1(
                 value=42,
-                left=TreeLeaf1(
+                left=TreeNode2(
                     value=42,
-                    left=TreeLeaf2(value=42),
-                    right=TreeLeaf2(value=42),
+                    left=TreeLeaf(value=42),
+                    right=TreeLeaf(value=42),
                 ),
-                right=TreeLeaf1(
+                right=TreeNode2(
                     value=42,
-                    left=TreeLeaf2(value=42),
-                    right=TreeLeaf2(value=42),
+                    left=TreeLeaf(value=42),
+                    right=TreeLeaf(value=42),
                 ),
             ),
-            right=TreeLeaf(
+            right=TreeNode1(
                 value=42,
-                left=TreeLeaf1(
+                left=TreeNode2(
                     value=42,
-                    left=TreeLeaf2(value=42),
-                    right=TreeLeaf2(value=42),
+                    left=TreeLeaf(value=42),
+                    right=TreeLeaf(value=42),
                 ),
-                right=TreeLeaf1(
+                right=TreeNode2(
                     value=42,
-                    left=TreeLeaf2(value=42),
-                    right=TreeLeaf2(value=42),
+                    left=TreeLeaf(value=42),
+                    right=TreeLeaf(value=42),
                 ),
             ),
+            leaves=[
+                TreeLeaf(value=42),
+            ],
         )
         item.serialize(null_check=False)
 
         # now let's nullify an attribute a few levels deep to test that `null_check` propagates
         item.left.left.left.value = None
         item.serialize(null_check=False)
+
+        # now with null check
+        with pytest.raises(Exception, match="Attribute 'left.value' cannot be None"):
+            item.serialize(null_check=True)
+
+        # now let's nullify an attribute of a map in a list to test that `null_check` propagates
+        item.left.left.left.value = 42
+        item.leaves[0].value = None
+        item.serialize(null_check=False)
+
+        # now with null check
+        with pytest.raises(Exception, match=r"Attribute 'value' cannot be None"):
+            item.serialize(null_check=True)
+
 
     def test_deserializing_map_four_layers_deep_works(self):
         fake_db = self.database_mocker(TreeModel,
@@ -3387,8 +3443,8 @@ class ModelInitTestCase(TestCase):
     def test_subclassed_map_attribute_with_map_attribute_member_with_initialized_instance_init(self):
         left = self._get_bin_tree()
         right = self._get_bin_tree(multiplier=2)
-        left_instance = TreeLeaf(**left)
-        right_instance = TreeLeaf(**right)
+        left_instance = TreeNode1(**left)
+        right_instance = TreeNode1(**right)
         actual = TreeModel(tree_key='key', left=left_instance, right=right_instance)
         self.assertEqual(actual.left.left.right.value, left_instance.left.right.value)
         self.assertEqual(actual.left.left.value, left_instance.left.value)

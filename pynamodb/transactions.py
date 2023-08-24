@@ -7,6 +7,7 @@ from pynamodb.expressions.update import Action
 from pynamodb.models import Model, _ModelFuture, _KeyType
 
 _M = TypeVar('_M', bound=Model)
+_TTransaction = TypeVar('_TTransaction', bound='Transaction')
 
 
 class Transaction:
@@ -22,7 +23,7 @@ class Transaction:
     def _commit(self):
         raise NotImplementedError()
 
-    def __enter__(self) -> 'Transaction':
+    def __enter__(self: _TTransaction) -> _TTransaction:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -30,11 +31,11 @@ class Transaction:
             self._commit()
 
 
-class TransactGet(Generic[_M], Transaction):
+class TransactGet(Transaction):
 
     _results: Optional[List] = None
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._get_items: List[Dict] = []
         self._futures: List[_ModelFuture] = []
         super(TransactGet, self).__init__(*args, **kwargs)

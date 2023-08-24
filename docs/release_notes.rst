@@ -1,5 +1,114 @@
+.. highlight:: none
+
 Release Notes
 =============
+
+v5.3.5
+----------
+* Fix message of some exceptions derived from :class:`~pynamodb.exceptions.PynamoDBException` (#1113).
+
+Contributors to this release:
+
+* @pauliokas
+
+
+v5.3.4
+----------
+* Make serialization :code:`null_check=False` propagate to maps inside lists (#1128).
+
+
+v5.3.3
+----------
+* Fix :py:class:`~pynamodb.pagination.PageIterator` and :py:class:`~pynamodb.pagination.ResultIterator`
+  to allow recovery from an exception when retrieving the first item (#1101).
+
+  .. code-block:: python
+
+    results = MyModel.query('hash_key')
+    while True:
+        try:
+            item = next(results)
+        except StopIteration:
+            break
+        except pynamodb.exceptions.QueryError as ex:
+            if ex.cause_response_code == 'ThrottlingException':
+                time.sleep(1)  # for illustration purposes only
+            else:
+                raise
+        else:
+            handle_item(item)
+
+
+v5.3.2
+----------
+* Prevent ``typing_tests`` from being installed into site-packages (#1118)
+
+Contributors to this release:
+
+* @musicinmybrain
+
+
+v5.3.1
+----------
+* Fixed issue introduced in 5.3.0: using :py:class:`~pynamodb.connection.table.TableConnection` directly (not through a model)
+  raised the following exception::
+
+    pynamodb.exceptions.TableError: Meta-table for '(table-name)' not initialized
+
+* Fix typing on :py:class:`~pynamodb.transactions.TransactGet` (backport of #1057)
+
+
+v5.3.0
+----------
+* No longer call ``DescribeTable`` API before first operation
+
+  Before this change, we would call ``DescribeTable`` before the first operation
+  on a given table in order to discover its schema. This slowed down bootstrap
+  (particularly important for lambdas), complicated testing and could potentially
+  cause inconsistent behavior since queries were serialized using the table's
+  (key) schema but deserialized using the model's schema.
+
+  With this change, both queries and models now use the model's schema.
+
+
+v5.2.3
+----------
+* Update for botocore 1.28 private API change (#1087) which caused the following exception::
+
+    TypeError: Cannot mix str and non-str arguments
+
+
+v5.2.2
+----------
+* Update for botocore 1.28 private API change (#1083) which caused the following exception::
+
+    TypeError: _convert_to_request_dict() missing 1 required positional argument: 'endpoint_url'
+
+
+v5.2.1
+----------
+* Fix issue from 5.2.0 with attempting to set GSI provisioned throughput on PAY_PER_REQUEST billing mode (#1018)
+
+
+v5.2.0
+----------
+* The ``IndexMeta`` class has been removed. Now ``type(Index) == type`` (#998)
+* JSON serialization support (``Model.to_json`` and ``Model.from_json``) has been added (#857)
+* Improved type annotations for expressions and transactions (#951, #991)
+* Always use Model attribute definitions in create table schema (#996)
+
+
+v5.1.0
+----------
+
+:date: 2021-06-29
+
+* Introduce ``DynamicMapAttribute`` to enable partially defining attributes on a ``MapAttribute`` (#868)
+* Quality of life improvements: Type annotations, better comment, more resilient test (#934, #936, #948)
+* Fix type annotation of ``is_in`` conditional expression (#947)
+* Null errors should include full attribute path (#915)
+* Fix for serializing and deserializing dates prior to year 1000 (#949)
+
 
 v5.0.3
 ----------
@@ -86,7 +195,7 @@ v4.3.3
 
 * Add type stubs for indexing into a ``ListAttribute`` for forming conditional expressions (#774)
 
-  ::
+  .. code-block:: python
 
     class MyModel(Model):
       ...
@@ -168,7 +277,9 @@ v4.1.0
 
 This is a backwards compatible, minor release.
 
-* In the Model's Meta, you may now provide an AWS session token, which is mostly useful for assumed roles (#700)::
+* In the Model's Meta, you may now provide an AWS session token, which is mostly useful for assumed roles (#700):
+
+  .. code-block:: python
 
     sts_client = boto3.client("sts")
     role_object = sts_client.assume_role(RoleArn=role_arn, RoleSessionName="role_name", DurationSeconds=BOTO3_CLIENT_DURATION)

@@ -1,6 +1,7 @@
 """
 Lowest level connection
 """
+import inspect
 import json
 import logging
 import random
@@ -9,7 +10,7 @@ import time
 import uuid
 from base64 import b64decode
 from threading import local
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, cast
 
 import botocore.client
 import botocore.exceptions
@@ -19,6 +20,7 @@ from botocore.hooks import first_non_none_response
 from botocore.exceptions import BotoCoreError
 from botocore.session import get_session
 
+from pynamodb.connection._botocore_private import BotocoreBaseClientPrivate
 from pynamodb.constants import (
     RETURN_CONSUMED_CAPACITY_VALUES, RETURN_ITEM_COLL_METRICS_VALUES,
     RETURN_ITEM_COLL_METRICS, RETURN_CONSUMED_CAPACITY, RETURN_VALUES_VALUES,
@@ -76,6 +78,13 @@ class MetaTable(object):
         if self.data:
             return "MetaTable<{}>".format(self.data.get(TABLE_NAME))
         return ""
+
+    @property
+    def table_name(self) -> str:
+        """
+        Returns the table name
+        """
+        return self.data[TABLE_NAME]
 
     @property
     def range_keyname(self) -> Optional[str]:
@@ -251,7 +260,8 @@ class Connection(object):
         self._tables: Dict[str, MetaTable] = {}
         self.host = host
         self._local = local()
-        self._client = None
+        self._client: Optional[BotocoreBaseClientPrivate] = None
+        self._convert_to_request_dict__endpoint_url = False
         if region:
             self.region = region
         else:
@@ -355,10 +365,28 @@ class Connection(object):
         2. It provides a place to monkey patch HTTP requests for unit testing
         """
         operation_model = self.client._service_model.operation_model(operation_name)
-        request_dict = self.client._convert_to_request_dict(
-            operation_kwargs,
-            operation_model,
-        )
+        if self._convert_to_request_dict__endpoint_url:
+            request_context = {
+                'client_region': self.region,
+                'client_config': self.client.meta.config,
+                'has_streaming_input': operation_model.has_streaming_input,
+                'auth_type': operation_model.auth_type,
+            }
+            endpoint_url, additional_headers = self.client._resolve_endpoint_ruleset(
+                operation_model, operation_kwargs, request_context
+            )
+            request_dict = self.client._convert_to_request_dict(
+                api_params=operation_kwargs,
+                operation_model=operation_model,
+                endpoint_url=endpoint_url,
+                context=request_context,
+                headers=additional_headers,
+            )
+        else:
+            request_dict = self.client._convert_to_request_dict(
+                operation_kwargs,
+                operation_model,
+            )
 
         for i in range(0, self._max_retry_attempts_exception + 1):
             attempt_number = i + 1
@@ -519,7 +547,7 @@ class Connection(object):
         return self._local.session
 
     @property
-    def client(self):
+    def client(self) -> BotocoreBaseClientPrivate:
         """
         Returns a botocore dynamodb client
         """
@@ -532,28 +560,26 @@ class Connection(object):
                 parameter_validation=False,  # Disable unnecessary validation for performance
                 connect_timeout=self._connect_timeout_seconds,
                 read_timeout=self._read_timeout_seconds,
-                max_pool_connections=self._max_pool_connections)
-            self._client = self.session.create_client(SERVICE_NAME, self.region, endpoint_url=self.host, config=config)
+                max_pool_connections=self._max_pool_connections,
+            )
+            self._client = cast(BotocoreBaseClientPrivate, self.session.create_client(SERVICE_NAME, self.region, endpoint_url=self.host, config=config))
+            self._convert_to_request_dict__endpoint_url = 'endpoint_url' in inspect.signature(self._client._convert_to_request_dict).parameters
         return self._client
 
-    def get_meta_table(self, table_name: str, refresh: bool = False):
+    def add_meta_table(self, meta_table: MetaTable) -> None:
         """
-        Returns a MetaTable
+        Adds information about the table's schema.
         """
-        if table_name not in self._tables or refresh:
-            operation_kwargs = {
-                TABLE_NAME: table_name
-            }
-            try:
-                data = self.dispatch(DESCRIBE_TABLE, operation_kwargs)
-                self._tables[table_name] = MetaTable(data.get(TABLE_KEY))
-            except BotoCoreError as e:
-                raise TableError("Unable to describe table: {}".format(e), e)
-            except ClientError as e:
-                if 'ResourceNotFound' in e.response['Error']['Code']:
-                    raise TableDoesNotExist(e.response['Error']['Message'])
-                else:
-                    raise
+        if meta_table.table_name in self._tables:
+            raise ValueError(f"Meta-table for '{meta_table.table_name}' already added")
+        self._tables[meta_table.table_name] = meta_table
+
+    def get_meta_table(self, table_name: str) -> MetaTable:
+        """
+        Returns information about the table's schema.
+        """
+        if table_name not in self._tables:
+            self.describe_table(table_name)
         return self._tables[table_name]
 
     def create_table(
@@ -585,8 +611,8 @@ class Connection(object):
             raise ValueError("attribute_definitions argument is required")
         for attr in attribute_definitions:
             attrs_list.append({
-                ATTR_NAME: attr.get('attribute_name'),
-                ATTR_TYPE: attr.get('attribute_type')
+                ATTR_NAME: attr.get(ATTR_NAME) or attr['attribute_name'],
+                ATTR_TYPE: attr.get(ATTR_TYPE) or attr['attribute_type']
             })
         operation_kwargs[ATTR_DEFINITIONS] = attrs_list
 
@@ -616,8 +642,8 @@ class Connection(object):
         key_schema_list = []
         for item in key_schema:
             key_schema_list.append({
-                ATTR_NAME: item.get('attribute_name'),
-                KEY_TYPE: str(item.get('key_type')).upper()
+                ATTR_NAME: item.get(ATTR_NAME) or item['attribute_name'],
+                KEY_TYPE: str(item.get(KEY_TYPE) or item['key_type']).upper()
             })
         operation_kwargs[KEY_SCHEMA] = sorted(key_schema_list, key=lambda x: x.get(KEY_TYPE))
 
@@ -744,13 +770,26 @@ class Connection(object):
         """
         Performs the DescribeTable operation
         """
+        operation_kwargs = {
+            TABLE_NAME: table_name
+        }
         try:
-            tbl = self.get_meta_table(table_name, refresh=True)
-            if tbl:
-                return tbl.data
-        except ValueError:
-            pass
-        raise TableDoesNotExist(table_name)
+            data = self.dispatch(DESCRIBE_TABLE, operation_kwargs)
+            table_data = data.get(TABLE_KEY)
+            # For compatibility with existing code which uses Connection directly,
+            # we can let DescribeTable set the meta table.
+            if table_data:
+                meta_table = MetaTable(table_data)
+                if meta_table.table_name not in self._tables:
+                    self.add_meta_table(meta_table)
+            return table_data
+        except BotoCoreError as e:
+            raise TableError("Unable to describe table: {}".format(e), e)
+        except ClientError as e:
+            if 'ResourceNotFound' in e.response['Error']['Code']:
+                raise TableDoesNotExist(e.response['Error']['Message'])
+            else:
+                raise
 
     def get_item_attribute_map(
         self,

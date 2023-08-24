@@ -8,11 +8,13 @@ import botocore.exceptions
 
 
 class PynamoDBException(Exception):
+    msg: str
+
     """
     A common exception class
     """
     def __init__(self, msg: Optional[str] = None, cause: Optional[Exception] = None) -> None:
-        self.msg = msg
+        self.msg = msg if msg is not None else self.msg
         self.cause = cause
         super(PynamoDBException, self).__init__(self.msg)
 
@@ -125,6 +127,17 @@ class AttributeDeserializationError(TypeError):
     def __init__(self, attr_name: str, attr_type: str):
         msg = "Cannot deserialize '{}' attribute from type: {}".format(attr_name, attr_type)
         super(AttributeDeserializationError, self).__init__(msg)
+
+
+class AttributeNullError(ValueError):
+    def __init__(self, attr_name: str) -> None:
+        self.attr_path = attr_name
+
+    def __str__(self):
+        return f"Attribute '{self.attr_path}' cannot be None"
+
+    def prepend_path(self, attr_name: str) -> None:
+        self.attr_path = attr_name + '.' + self.attr_path
 
 
 class VerboseClientError(botocore.exceptions.ClientError):

@@ -13,15 +13,24 @@ from datetime import timedelta
 from datetime import timezone
 from inspect import getfullargspec
 from inspect import getmembers
-from typing import Any, Callable, Dict, Generic, List, Mapping, Optional, TypeVar, Type, Union, Set, overload
+from typing import Any, Callable, Dict, Generic, List, Mapping, Optional, TypeVar, Type, Union, Set, overload, Iterable
 from typing import TYPE_CHECKING
 
 from pynamodb._compat import GenericMeta
-from pynamodb.constants import (
-    BINARY, BINARY_SET, BOOLEAN, DATETIME_FORMAT, DEFAULT_ENCODING,
-    LIST, MAP, NULL, NUMBER, NUMBER_SET, STRING, STRING_SET
-)
+from pynamodb.constants import BINARY
+from pynamodb.constants import BINARY_SET
+from pynamodb.constants import BOOLEAN
+from pynamodb.constants import DATETIME_FORMAT
+from pynamodb.constants import DEFAULT_ENCODING
+from pynamodb.constants import LIST
+from pynamodb.constants import MAP
+from pynamodb.constants import NULL
+from pynamodb.constants import NUMBER
+from pynamodb.constants import NUMBER_SET
+from pynamodb.constants import STRING
+from pynamodb.constants import STRING_SET
 from pynamodb.exceptions import AttributeDeserializationError
+from pynamodb.exceptions import AttributeNullError
 from pynamodb.expressions.operand import Path
 
 
@@ -73,7 +82,7 @@ class Attribute(Generic[_T]):
         self.is_hash_key = hash_key
         self.is_range_key = range_key
 
-        # AttributeContainerMeta._initialize_attributes will ensure this is a string
+        # __set_name__ will ensure this is a string
         self.attr_path: List[str] = [attr_name]  # type: ignore
 
     @property
@@ -105,6 +114,9 @@ class Attribute(Generic[_T]):
             return instance.attribute_values.get(attr_name, None)
         else:
             return self
+
+    def __set_name__(self, owner: Type[Any], name: str) -> None:
+        self.attr_name = self.attr_name or name
 
     def _is_map_attribute_class_object(self, instance: 'Attribute') -> bool:
         return isinstance(instance, MapAttribute) and not instance._is_attribute_container()
@@ -163,7 +175,7 @@ class Attribute(Generic[_T]):
     def between(self, lower: Any, upper: Any) -> 'Between':
         return Path(self).between(lower, upper)
 
-    def is_in(self, *values: Any) -> 'In':
+    def is_in(self, *values: _T) -> 'In':
         return Path(self).is_in(*values)
 
     def exists(self) -> 'Exists':
@@ -198,10 +210,10 @@ class Attribute(Generic[_T]):
     def __or__(self, other: Any) -> '_IfNotExists':
         return Path(self).__or__(other)
 
-    def append(self, other: Any) -> '_ListAppend':
+    def append(self, other: Iterable) -> '_ListAppend':
         return Path(self).append(other)
 
-    def prepend(self, other: Any) -> '_ListAppend':
+    def prepend(self, other: Iterable) -> '_ListAppend':
         return Path(self).prepend(other)
 
     def set(self, value: Any) -> 'SetAction':
@@ -236,23 +248,9 @@ class AttributeContainerMeta(GenericMeta):
         cls._dynamo_to_python_attrs = {}
 
         for name, attribute in getmembers(cls, lambda o: isinstance(o, Attribute)):
-            initialized = False
-            if isinstance(attribute, MapAttribute):
-                # MapAttribute instances that are class attributes of an AttributeContainer class
-                # should behave like an Attribute instance and not an AttributeContainer instance.
-                initialized = attribute._make_attribute()
-
             cls._attributes[name] = attribute
-            if attribute.attr_name is None:
-                attribute.attr_name = name
             if attribute.attr_name != name:
                 cls._dynamo_to_python_attrs[attribute.attr_name] = name
-
-            if initialized and isinstance(attribute, MapAttribute):
-                # To support creating expressions from nested attributes, MapAttribute instances
-                # store local copies of the attributes in cls._attributes with `attr_path` set.
-                # Prepend the `attr_path` lists with the dynamo attribute name.
-                attribute._update_attribute_paths(attribute.attr_name)
 
         # Register the class with the discriminator if necessary.
         discriminators = [name for name, attr in cls._attributes.items() if isinstance(attr, DiscriminatorAttribute)]
@@ -346,18 +344,22 @@ class AttributeContainer(metaclass=AttributeContainerMeta):
         attribute_values: Dict[str, Dict[str, Any]] = {}
         for name, attr in self.get_attributes().items():
             value = getattr(self, name)
-            if isinstance(value, MapAttribute) and not value.validate(null_check=null_check):
-                raise ValueError("Attribute '{}' is not correctly typed".format(name))
+            try:
+                if isinstance(value, MapAttribute) and not value.validate(null_check=null_check):
+                    raise ValueError("Attribute '{}' is not correctly typed".format(name))
+            except AttributeNullError as e:
+                e.prepend_path(name)
+                raise
 
             if value is not None:
-                if isinstance(attr, MapAttribute):
+                if isinstance(attr, (ListAttribute, MapAttribute)):
                     attr_value = attr.serialize(value, null_check=null_check)
                 else:
                     attr_value = attr.serialize(value)
             else:
                 attr_value = None
             if null_check and attr_value is None and not attr.null:
-                raise ValueError("Attribute '{}' cannot be None".format(name))
+                raise AttributeNullError(name)
 
             if attr_value is not None:
                 attribute_values[attr.attr_name] = {attr.attr_type: attr_value}
@@ -375,6 +377,36 @@ class AttributeContainer(metaclass=AttributeContainerMeta):
             if attribute_value and NULL not in attribute_value:
                 value = attr.deserialize(attr.get_value(attribute_value))
                 setattr(self, name, value)
+
+    @classmethod
+    def _update_attribute_types(cls, attribute_values: Dict[str, Dict[str, Any]]):
+        """
+        Update the attribute types in the attribute values dictionary to disambiguate json string and array types
+        """
+        for attr in cls.get_attributes().values():
+            attribute_value = attribute_values.get(attr.attr_name)
+            if attribute_value:
+                AttributeContainer._coerce_attribute_type(attr.attr_type, attribute_value)
+                if isinstance(attr, ListAttribute) and attr.element_type and LIST in attribute_value:
+                    if issubclass(attr.element_type, AttributeContainer):
+                        for element in attribute_value[LIST]:
+                            if MAP in element:
+                                attr.element_type._update_attribute_types(element[MAP])
+                    else:
+                        for element in attribute_value[LIST]:
+                            AttributeContainer._coerce_attribute_type(attr.element_type.attr_type, element)
+                if isinstance(attr, AttributeContainer) and MAP in attribute_value:
+                    attr._update_attribute_types(attribute_value[MAP])
+
+    @staticmethod
+    def _coerce_attribute_type(attr_type: str, attribute_value: Dict[str, Any]):
+        # coerce attribute types to disambiguate json string and array types
+        if attr_type == BINARY and STRING in attribute_value:
+            attribute_value[BINARY] = attribute_value.pop(STRING)
+        if attr_type in {BINARY_SET, NUMBER_SET, STRING_SET} and LIST in attribute_value:
+            json_type = NUMBER if attr_type == NUMBER_SET else STRING
+            if all(next(iter(v)) == json_type for v in attribute_value[LIST]):
+                attribute_value[attr_type] = [value[json_type] for value in attribute_value.pop(LIST)]
 
     @classmethod
     def _get_discriminator_class(cls, attribute_values: Dict[str, Dict[str, Any]]) -> Optional[Type]:
@@ -681,7 +713,9 @@ class UTCDateTimeAttribute(Attribute[datetime]):
         """
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
-        fmt = value.astimezone(timezone.utc).strftime(DATETIME_FORMAT)
+        # Padding of years under 1000 is inconsistent and depends on system strftime:
+        # https://bugs.python.org/issue13305
+        fmt = value.astimezone(timezone.utc).strftime(DATETIME_FORMAT).zfill(31)
         return fmt
 
     def deserialize(self, value):
@@ -696,6 +730,8 @@ class UTCDateTimeAttribute(Attribute[datetime]):
         # This is ~5.8x faster than using strptime and 38x faster than dateutil.parser.parse.
         _int = int  # Hack to prevent global lookups of int, speeds up the function ~10%
         try:
+            # Fix pre-1000 dates serialized on systems where strftime doesn't pad w/older PynamoDB versions.
+            date_string = date_string.zfill(31)
             if (len(date_string) != 31 or date_string[4] != '-' or date_string[7] != '-'
                     or date_string[10] != 'T' or date_string[13] != ':' or date_string[16] != ':'
                     or date_string[19] != '.' or date_string[26:31] != '+0000'):
@@ -771,7 +807,7 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer):
     does not behave as both an Attribute AND an AttributeContainer. Rather an instance of MapAttribute behaves
     EITHER as an Attribute OR as an AttributeContainer, depending on where it was instantiated.
 
-    So, how do we create this dichotomous behavior? Using the AttributeContainerMeta metaclass.
+    So, how do we create this dichotomous behavior?
     All MapAttribute instances are initialized as AttributeContainers only. During construction of
     AttributeContainer classes (subclasses of MapAttribute and Model), any instances that are class attributes
     are transformed from AttributeContainers to Attributes (via the `_make_attribute` method call).
@@ -785,7 +821,7 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer):
         self.attribute_kwargs = {arg: attributes.pop(arg) for arg in self.attribute_args if arg in attributes}
 
         # Assume all instances should behave like an AttributeContainer. Instances that are intended to be
-        # used as Attributes will be transformed by AttributeContainerMeta during creation of the containing class.
+        # used as Attributes will be transformed during creation of the containing class.
         # Because of this do not use MRO or cooperative multiple inheritance, call the parent class directly.
         AttributeContainer.__init__(self, **attributes)
 
@@ -806,10 +842,9 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer):
         return 'attribute_values' in self.__dict__
 
     def _make_attribute(self):
-        # WARNING! This function is only intended to be called from the AttributeContainerMeta metaclass.
+        # WARNING! This function is only intended to be called from the __set_name__ function.
         if not self._is_attribute_container():
-            # This instance has already been initialized by another AttributeContainer class.
-            return False
+            raise AssertionError("MapAttribute._make_attribute called on an initialized instance")
         # During initialization the kwargs were stored in `attribute_kwargs`. Remove them and re-initialize the class.
         kwargs = self.attribute_kwargs
         del self.attribute_kwargs
@@ -821,10 +856,9 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer):
             # we have to store the local copy directly into __dict__ to prevent calling attr.__set__.
             # Use deepcopy so that `attr_path` and any local attributes are also copied.
             self.__dict__[name] = deepcopy(attr)
-        return True
 
     def _update_attribute_paths(self, path_segment):
-        # WARNING! This function is only intended to be called from the AttributeContainerMeta metaclass.
+        # WARNING! This function is only intended to be called from the __set_name__ function.
         if self._is_attribute_container():
             raise AssertionError("MapAttribute._update_attribute_paths called before MapAttribute._make_attribute")
         for name in self.get_attributes().keys():
@@ -854,20 +888,20 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer):
         # If this instance is being used as an Attribute, treat item access like the map dereference operator.
         # This provides equivalence between DynamoDB's nested attribute access for map elements (MyMap.nestedField)
         # and Python's item access for dictionaries (MyMap['nestedField']).
-        if self.is_raw():
-            return Path(self.attr_path + [str(item)])  # type: ignore
-        elif item in self._attributes:  # type: ignore
+        if item in self.get_attributes():
             return getattr(self, item)
+        elif self.is_raw():
+            return Path(self.attr_path + [str(item)])  # type: ignore
         else:
             raise AttributeError("'{}' has no attribute '{}'".format(self.__class__.__name__, item))
 
     def __setitem__(self, item, value):
         if not self._is_attribute_container():
             raise TypeError("'{}' object does not support item assignment".format(self.__class__.__name__))
-        if self.is_raw():
-            self.attribute_values[item] = value
-        elif item in self._attributes:  # type: ignore
+        if item in self.get_attributes():
             setattr(self, item, value)
+        elif self.is_raw():
+            self.attribute_values[item] = value
         else:
             raise AttributeError("'{}' has no attribute '{}'".format(self.__class__.__name__, item))
 
@@ -902,6 +936,19 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer):
             value = type(self)(**value)  # type: ignore
         return super().__set__(instance, value)  # type: ignore
 
+    def __set_name__(self, owner: Type[Any], name: str) -> None:
+        if issubclass(owner, AttributeContainer):
+            # MapAttribute instances that are class attributes of an AttributeContainer class
+            # should behave like an Attribute instance and not an AttributeContainer instance.
+            self._make_attribute()
+
+            super().__set_name__(owner, name)
+
+            # To support creating expressions from nested attributes, MapAttribute instances
+            # store local copies of the attributes in cls._attributes with `attr_path` set.
+            # Prepend the `attr_path` lists with the dynamo attribute name.
+            self._update_attribute_paths(self.attr_name)
+
     def _set_attributes(self, **attrs):
         """
         Sets the attributes for this object
@@ -918,12 +965,28 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer):
         if can_be_null and value is None:
             return True
         if getattr(self, key) is None:
-            raise ValueError("Attribute '{}' cannot be None".format(key))
+            raise AttributeNullError(key)
         return True  # TODO: check that the actual type of `value` meets requirements of `attr`
 
     def validate(self, *, null_check: bool = False):
         return all(self.is_correctly_typed(k, v, null_check=null_check)
                    for k, v in self.get_attributes().items())
+
+    def _serialize_undeclared_attributes(self, values, container: Dict):
+        # Continue to serialize NULL values in "raw" map attributes for backwards compatibility.
+        # This special case behavior for "raw" attributes should be removed in the future.
+        for attr_name in values:
+            if attr_name not in self.get_attributes():
+                v = values[attr_name]
+                attr_class = _get_class_for_serialize(v)
+                attr_type = attr_class.attr_type
+                attr_value = attr_class.serialize(v)
+                if attr_value is None:
+                    # When attribute values serialize to "None" (e.g. empty sets) we store {"NULL": True} in DynamoDB.
+                    attr_type = NULL
+                    attr_value = True
+                container[attr_name] = {attr_type: attr_value}
+        return container
 
     def serialize(self, values, *, null_check: bool = True):
         if not self.is_raw():
@@ -941,20 +1004,8 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer):
 
             return AttributeContainer._container_serialize(values, null_check=null_check)
 
-        # Continue to serialize NULL values in "raw" map attributes for backwards compatibility.
-        # This special case behavior for "raw" attributes should be removed in the future.
-        rval = {}
-        for attr_name in values:
-            v = values[attr_name]
-            attr_class = _get_class_for_serialize(v)
-            attr_type = attr_class.attr_type
-            attr_value = attr_class.serialize(v)
-            if attr_value is None:
-                # When attribute values serialize to "None" (e.g. empty sets) we store {"NULL": True} in DynamoDB.
-                attr_type = NULL
-                attr_value = True
-            rval[attr_name] = {attr_type: attr_value}
-        return rval
+        # For a "raw" MapAttribute all fields are undeclared
+        return self._serialize_undeclared_attributes(values, {})
 
     def deserialize(self, values):
         """
@@ -978,6 +1029,62 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer):
         for key, value in self.attribute_values.items():
             result[key] = value.as_dict() if isinstance(value, MapAttribute) else value
         return result
+
+
+class DynamicMapAttribute(MapAttribute):
+    """
+    A map attribute that supports declaring attributes (like an AttributeContainer) but will also store
+    any other values that are set on it (like a raw MapAttribute).
+
+    >>> class MyDynamicMapAttribute(DynamicMapAttribute):
+    >>>     a_date_time = UTCDateTimeAttribute()  # raw map attributes cannot serialize/deserialize datetime values
+    >>>
+    >>> dynamic_map = MyDynamicMapAttribute()
+    >>> dynamic_map.a_date_time = datetime.utcnow()
+    >>> dynamic_map.a_number = 5
+    >>> dynamic_map.serialize()  # {'a_date_time': {'S': 'xxx'}, 'a_number': {'N': '5'}}
+    """
+
+    def __setattr__(self, name, value):
+        # Set attributes via the Attribute descriptor if it exists.
+        if name in self.get_attributes():
+            object.__setattr__(self, name, value)
+        else:
+            super().__setattr__(name, value)
+
+    def serialize(self, values, *, null_check: bool = True):
+        if not isinstance(values, type(self)):
+            # Copy the values onto an instance of the class for serialization.
+            instance = type(self)()
+            instance.attribute_values = {}  # clear any defaults
+            instance._set_attributes(**values)
+            values = instance
+
+        # this serializes the class defined attributes.
+        # we do this first because we have type checks that validate the data
+        rval = AttributeContainer._container_serialize(values, null_check=null_check)
+
+        # this serializes the dynamically defined attributes
+        # we have no real type safety here so we have to dynamically construct the type to write to dynamo
+        self._serialize_undeclared_attributes(values, rval)
+
+        return rval
+
+    def deserialize(self, values):
+        # this deserializes the class defined attributes
+        # we do this first so that the we populate the defined object attributes fields properly with type safety
+        instance = self._instantiate(values)
+        # this deserializes the dynamically defined attributes
+        for attr_name, value in values.items():
+            if instance._dynamo_to_python_attr(attr_name) not in instance.get_attributes():
+                attr_type, attr_value = next(iter(value.items()))
+                instance[attr_name] = DESERIALIZE_CLASS_MAP[attr_type].deserialize(attr_value)
+        return instance
+
+    @classmethod
+    def is_raw(cls):
+        # All subclasses of DynamicMapAttribute should be treated like "raw" map attributes.
+        return True
 
 
 def _get_class_for_serialize(value):
@@ -1016,7 +1123,7 @@ class ListAttribute(Generic[_T], Attribute[List[_T]]):
                 raise ValueError("'of' must be a subclass of Attribute")
             self.element_type = of
 
-    def serialize(self, values):
+    def serialize(self, values, *, null_check: bool = True):
         """
         Encode the given list of objects into a list of AttributeValue types.
         """
@@ -1026,7 +1133,10 @@ class ListAttribute(Generic[_T], Attribute[List[_T]]):
             if self.element_type and v is not None and not isinstance(attr_class, self.element_type):
                 raise ValueError("List elements must be of type: {}".format(self.element_type.__name__))
             attr_type = attr_class.attr_type
-            attr_value = attr_class.serialize(v)
+            if isinstance(attr_class, (ListAttribute, MapAttribute)):
+                attr_value = attr_class.serialize(v, null_check=null_check)
+            else:
+                attr_value = attr_class.serialize(v)
             if attr_value is None:
                 # When attribute values serialize to "None" (e.g. empty sets) we store {"NULL": True} in DynamoDB.
                 attr_type = NULL
@@ -1106,4 +1216,5 @@ SERIALIZE_CLASS_MAP = {
     float: NumberAttribute(),
     int: NumberAttribute(),
     str: UnicodeAttribute(),
+    bytes: BinaryAttribute(),
 }
